@@ -1,0 +1,4 @@
+*.log
+*.cal
+*.vcp
+__pycache__/

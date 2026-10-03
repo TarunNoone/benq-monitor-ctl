@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# monitor-ctl — control BenQ EX2510S (and similar DDC/CI monitors) from Linux
+#
+# Picture-mode values reverse-engineered from the monitor's own OSD (Nov 2025):
+#   0x00 Custom     0x0A sRGB        0x0F M-Book      0x15 FPS
+#   0x1C Game_HDRi  0x1D Cinema_HDRi 0x1E Racing_Game 0x1F ePaper
+#   0x23 HDR        0x26 RPG
+#
+# Color temperature (VCP 0x14, adjustable in Custom mode only):
+#   0x04 5000K      0x05 6500K       0x08 9300K       0x0B User1
+#
+# Low Blue Light filter (VCP 0x19, undeclared by monitor, BenQ-private):
+#   continuous 0-20; discovered via value-fingerprint scan (filter=17 -> 0x11)
+# Black Equalizer (VCP 0x7a, undeclared): continuous 0-10
+# Color Vibrance  (VCP 0x8a, undeclared): continuous 0-20
+#
+# Requires: ddcutil, and read access to the monitor's i2c device
+# (group membership, udev rule, or root). See `ddcutil detect` first.
+
+set -u
+
+DDCUTIL="${DDCUTIL:-ddcutil}"
+MONITOR="${MONITOR:--d 1}"          # which ddcutil display; override via env
+
+# mode-name -> VCP value
+declare -Ar MODES=(
+  [custom]=0x00     [srgb]=0x0A     [mbook]=0x0F     [fps]=0x15
+  [game_hdri]=0x1C  [cinema_hdri]=0x1D  [racing_game]=0x1E
+  [epaper]=0x1F     [hdr]=0x23      [rpg]=0x26
+)
+
+# pretty names for `list`
+declare -Ar PRETTY=(
+  [custom]=Custom [srgb]=sRGB [mbook]=M-Book [fps]=FPS
+  [game_hdri]="Game HDRi" [cinema_hdri]="Cinema HDRi" [racing_game]="Racing Game"
+  [epaper]=ePaper [hdr]=HDR [rpg]=RPG
+)
+
+declare -Ar TEMPS=(
+  [warm]=0x04 [normal]=0x05 [cool]=0x08 [user]=0x0B
+)
+declare -Ar TEMP_NAMES=(
+  [0x04]="5000K" [0x05]="6500K" [0x08]="9300K" [0x0B]="User 1"
+)
+
+ddc() { $DDCUTIL $MONITOR "$@"; }
+
+die() { echo "monitor-ctl: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+monitor-ctl — DDC/CI control for the BenQ EX2510S
+
+Usage:
+  monitor-ctl list                   show known picture modes
+  monitor-ctl get                    current picture mode
+  monitor-ctl set <mode>             switch picture mode (see list)
+  monitor-ctl temp [warm|normal|cool|user]
+                                     get or set color temperature
+                                     (monitor applies it in Custom mode)
+  monitor-ctl brightness [0-100]     get or set brightness
+  monitor-ctl contrast   [0-100]     get or set contrast
+  monitor-ctl bluelight [0-20]       get or set low blue light filter
+  monitor-ctl blackeq [0-10]         get or set black equalizer
+  monitor-ctl vibrance [0-20]        get or set color vibrance
+  monitor-ctl sharpness [0-10]       get or set sharpness
+  monitor-ctl input [dp|hdmi1|hdmi2] get or set input source
+  monitor-ctl power [on|off]         get or set power state
+  monitor-ctl save <file>            dump monitor color settings
+  monitor-ctl load <file>            restore monitor color settings
+  monitor-ctl raw <code> [value]     raw getvcp/setvcp escape hatch
+
+Env:  MONITOR="-d 2"  select another ddcutil display
+      DDCUTIL=/path   alternate ddcutil binary
+EOF
+}
+
+retry_getvcp() {  # ddcutil flubs replies during mode transitions; try twice
+  local out
+  out=$(ddc getvcp "$1" 2>&1)
+  case "$out" in *"UNABLE TO FORMAT"*|*"Invalid value"*) sleep 1; out=$(ddc getvcp "$1" 2>&1);; esac
+  printf '%s\n' "$out"
+}
+
+cmd_list() {
+  printf '%-14s %s\n' "MODE" "VCP"
+  for m in "${!MODES[@]}"; do
+    printf '%-14s %s\n' "${PRETTY[$m]}" "${MODES[$m]}"
+  done | sort
+}
+
+cmd_get() {
+  local out val
+  out=$(retry_getvcp 0xDC)
+  val=$(sed -n 's/.*(sl=\(0x[0-9a-fA-F]*\)).*/\1/p' <<<"$out")
+  [[ -n "$val" ]] || die "could not read picture mode: $out"
+  for m in "${!MODES[@]}"; do
+    if [[ "${MODES[$m],,}" == "${val,,}" ]]; then
+      echo "${PRETTY[$m]} ($val)"; return
+    fi
+  done
+  echo "unknown ($val)"
+}
+
+cmd_set() {
+  local want="${1,,}" val
+  [[ -n "$want" ]] || die "set requires a mode name (see: monitor-ctl list)"
+  val="${MODES[$want]:-}"
+  [[ -n "$val" ]] || val="$want"          # allow passing 0xNN directly
+  ddc setvcp 0xDC "$val" >/dev/null \
+    || die "monitor refused $val (unsupported mode or transition in progress)"
+  sleep 2
+  cmd_get
+}
+
+getset_scalar() {   # $1=vcp code  $2=label  $3=passed value (optional)
+  if [[ -z "${3:-}" ]]; then
+    retry_getvcp "$1"
+  else
+    ddc setvcp "$1" "$3" >/dev/null || die "monitor refused $2=$3"
+    sleep 1
+    retry_getvcp "$1"
+  fi
+}
+
+cmd_temp() {
+  local want="${1:-get}" val
+  if [[ "$want" == "get" || -z "$want" ]]; then
+    local out
+    out=$(retry_getvcp 0x14)
+    case "$out" in
+      *"UNABLE TO FORMAT"*) echo "unavailable in current mode (Custom only)"; return 0 ;;
+    esac
+    local cur
+    cur=$(sed -n 's/.*(\(0x[0-9a-fA-F]*\)).*/\1/p' <<<"$out")
+    echo "${TEMP_NAMES[$cur]:-$cur} (current)"
+    return 0
+  fi
+  val="${TEMPS[$want]:-}"
+  [[ -n "$val" ]] || val="$want"
+  ddc setvcp 0x14 "$val" >/dev/null || die "monitor refused temp=$val"
+  sleep 2
+  cmd_temp get
+}
+
+cmd_bluelight() {   # 0x19, continuous 0-20 (BenQ-private, declared via UDF)
+  getset_scalar 0x19 "blue light filter" "${1:-}"
+}
+
+cmd_blackeq() {     # 0x7a, continuous 0-10 (BenQ-private)
+  getset_scalar 0x7a "black equalizer" "${1:-}"
+}
+
+cmd_vibrance() {    # 0x8a, continuous 0-20 (BenQ-private)
+  getset_scalar 0x8a "color vibrance" "${1:-}"
+}
+
+cmd_sharpness() {   # 0x87, standard MCCS code
+  getset_scalar 0x87 "sharpness" "${1:-}"
+}
+
+cmd_input() {
+  case "${1:-get}" in    get)      retry_getvcp 0x60 ;;
+    dp)       getset_scalar 0x60 "input" 0x0F ;;
+    hdmi1)    getset_scalar 0x60 "input" 0x11 ;;
+    hdmi2)    getset_scalar 0x60 "input" 0x12 ;;
+    *)        die "input: use get|dp|hdmi1|hdmi2" ;;
+  esac
+}
+
+cmd_power() {
+  case "${1:-get}" in
+    get)  retry_getvcp 0xD6 ;;
+    on)   getset_scalar 0xD6 "power" 0x01 ;;
+    off)  getset_scalar 0xD6 "power" 0x05 ;;
+    *)    die "power: use get|on|off" ;;
+  esac
+}
+
+cmd_save() {
+  [[ -n "${1:-}" ]] || die "save requires a file path"
+  ddc dumpvcp "$1" >/dev/null || die "dumpvcp failed"
+  echo "saved color settings to $1"
+}
+
+cmd_load() {
+  [[ -n "${1:-}" ]] || die "load requires a file path"
+  [[ -f "$1" ]] || die "no such file: $1"
+  ddc loadvcp "$1" >/dev/null || die "loadvcp failed"
+  echo "restored color settings from $1"
+}
+
+cmd_raw() {
+  [[ -n "${1:-}" ]] || die "raw requires a VCP code, e.g. 0x10"
+  if [[ -n "${2:-}" ]]; then ddc setvcp "$1" "$2" >/dev/null || die "setvcp $1 $2 failed"
+  else retry_getvcp "$1"; fi
+}
+
+[[ -n "${1:-}" ]] || { usage; exit 0; }
+case "$1" in
+  list|ls)          cmd_list ;;
+  get|status)       cmd_get ;;
+  set|mode)         shift; cmd_set "${1:-}" ;;
+  brightness|bri)   getset_scalar 0x10 "brightness" "${2:-}" ;;
+  contrast|con)     getset_scalar 0x12 "contrast" "${2:-}" ;;
+  input)            shift; cmd_input "${1:-get}" ;;
+  temp)             shift; cmd_temp "${1:-get}" ;;
+  bluelight|lbl)    shift; cmd_bluelight "${1:-}" ;;
+  blackeq|beq)      shift; cmd_blackeq "${1:-}" ;;
+  vibrance|vib)     shift; cmd_vibrance "${1:-}" ;;
+  sharpness|sharp)  shift; cmd_sharpness "${1:-}" ;;
+  power)            shift; cmd_power "${1:-get}" ;;
+  save)             shift; cmd_save "${1:-}" ;;
+  load)             shift; cmd_load "${1:-}" ;;
+  raw)              shift; cmd_raw "${1:-}" "${2:-}" ;;
+  -h|--help|help)   usage ;;
+  *)                usage; die "unknown command: $1" ;;
+esac
