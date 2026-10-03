@@ -6,6 +6,8 @@ Linux command-line control for the **BenQ Mobiuz EX2510S** (and likely sibling M
 
 **This project was made by an AI.** It was developed end-to-end by the [OpenCode](https://opencode.ai) coding agent running the **GLM-5.3-Flash** model, with a human providing direction and verifying every hardware write on the physical monitor. Treat it accordingly: review the code, test carefully, and use at your own risk. No warranty.
 
+**Unmaintained.** This repository is provided as-is. It will not receive updates, and issues or pull requests will not be reviewed.
+
 ## What it controls
 
 | Control | VCP code | Range | Notes |
@@ -85,7 +87,7 @@ Negative results were established the same way (full-sweep + commit-on-close re-
 
 ## Compatibility
 
-Developed and verified on a **BenQ EX2510S** (RealTek scaler, MCCS 2.2). Other Mobiuz/gaming BenQ models likely share some of these codes but nothing is guaranteed — run `ddcutil probe` and the methodology above before trusting any mapping. PRs with per-model `.mccs` files welcome.
+Developed and verified on a **BenQ EX2510S** (RealTek scaler, MCCS 2.2). Other Mobiuz/gaming BenQ models likely share some of these codes but nothing is guaranteed — run `ddcutil probe` and the methodology above before trusting any mapping on a different model.
 
 ## License
 
